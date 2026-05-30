@@ -1,1 +1,4 @@
 # VGGT_modly
+
+
+STAND BY ON WORKING MODEL
