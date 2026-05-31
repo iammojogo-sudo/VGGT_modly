@@ -68,7 +68,7 @@
             { "value": "mesh",       "label": "Mesh (Poisson)" },
             { "value": "pointcloud", "label": "Point cloud only" }
           ],
-          "tooltip": "Mesh runs Poisson reconstruction over the points. Point cloud exports the raw colored points (most faithful to exactly what was observed)."
+          "tooltip": "Mesh outputs a triangulated surface: Poisson if Open3D is installed, otherwise a dense per-view depth-grid mesh (no Open3D needed). Point cloud exports the raw colored points."
         },
         {
           "id": "voxel_size",
@@ -156,32 +156,6 @@
             { "value": 20, "label": "20 (cluttered)" }
           ],
           "tooltip": "How many flat surfaces to extract, largest first. A bare room is ~6 (4 walls + floor + ceiling); raise it if furniture or shelves should also become planes."
-        },
-        {
-          "id": "edge_filter",
-          "label": "Edge Filter",
-          "type": "select",
-          "default": "0.05",
-          "options": [
-            { "value": "0",     "label": "Off" },
-            { "value": "0.08",  "label": "Light" },
-            { "value": "0.05",  "label": "Default" },
-            { "value": "0.025", "label": "Strong" }
-          ],
-          "tooltip": "Removes the 'flying pixel' skirts at depth edges by dropping pixels with a large depth jump. Stronger = cleaner edges but can nibble surfaces seen at a glancing angle."
-        },
-        {
-          "id": "point_budget",
-          "label": "Point Budget",
-          "type": "select",
-          "default": 500000,
-          "options": [
-            { "value": 200000,  "label": "200k (lightest)" },
-            { "value": 500000,  "label": "500k (default)" },
-            { "value": 1000000, "label": "1M" },
-            { "value": 0,       "label": "All (may freeze viewer)" }
-          ],
-          "tooltip": "Caps how many points the point-cloud output writes so the viewer doesn't choke. VGGT can emit millions; 200k-500k renders smoothly."
         }
       ],
       "output": "mesh",
