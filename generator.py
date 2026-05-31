@@ -150,11 +150,14 @@ class VGGTSceneGenerator(BaseGenerator):
         poisson_depth = _safe_int(params.get("poisson_depth"), 9)
         density_q     = _safe_float(params.get("density_quantile"), 0.02)
         clean_float   = (params.get("clean_floaters") or "true") == "true"
+        postprocess   = params.get("postprocess") or "none"
+        plane_tol     = _safe_float(params.get("plane_tolerance"), 0.012)
+        max_planes    = _safe_int(params.get("max_planes"), 10)
 
-        print("[VGGTSceneGenerator] images_dir=%s max_views=%s conf_pct=%.1f mode=%s "
-              "voxel=%.4f poisson_depth=%s density_q=%.3f clean=%s"
-              % (images_dir, max_views, conf_pct, output_mode,
-                 voxel_size, poisson_depth, density_q, clean_float))
+        print("[VGGTSceneGenerator] images_dir=%s max_views=%s conf_pct=%.1f mode=%s post=%s "
+              "voxel=%.4f poisson_depth=%s density_q=%.3f clean=%s max_planes=%s"
+              % (images_dir, max_views, conf_pct, output_mode, postprocess,
+                 voxel_size, poisson_depth, density_q, clean_float, max_planes))
 
         # ---- Collect input images -----------------------------------
         self._report(progress_cb, 4, "Collecting images...")
@@ -241,16 +244,29 @@ class VGGTSceneGenerator(BaseGenerator):
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         stamp = "%d_%s" % (int(time.time()), uuid.uuid4().hex[:8])
 
-        out_obj = None
-        if output_mode != "pointcloud":
+        out_obj  = None
+        out_kind = "points"
+
+        if postprocess in ("ransac_planes", "manhattan"):
+            self._report(progress_cb, 82, "Fitting planes...")
+            out_obj = self._planar_mesh(
+                pts, cols,
+                manhattan=(postprocess == "manhattan"),
+                tol_frac=plane_tol,
+                max_planes=max_planes,
+            )
+            if out_obj is not None:
+                out_kind = "planar"
+        elif output_mode != "pointcloud":
             self._report(progress_cb, 82, "Meshing (Poisson)...")
             out_obj = self._poisson_mesh(pts, cols, voxel_size, poisson_depth, density_q, clean_float)
+            if out_obj is not None:
+                out_kind = "scene"
 
         if out_obj is None:
-            out_obj  = trimesh.PointCloud(pts, (cols * 255).astype("uint8"))
-            out_path = self.outputs_dir / ("%s_points.glb" % stamp)
-        else:
-            out_path = self.outputs_dir / ("%s_scene.glb" % stamp)
+            out_obj = trimesh.PointCloud(pts, (cols * 255).astype("uint8"))
+
+        out_path = self.outputs_dir / ("%s_%s.glb" % (stamp, out_kind))
 
         self._report(progress_cb, 96, "Exporting...")
         out_obj.export(str(out_path))
@@ -324,6 +340,169 @@ class VGGTSceneGenerator(BaseGenerator):
             print("[VGGTSceneGenerator] Meshing failed (%s) — exporting point cloud." % exc)
             traceback.print_exc()
             return None
+
+    # ------------------------------------------------------------------
+    # Planar cleanup (RANSAC + Manhattan snap)
+    # ------------------------------------------------------------------
+
+    def _planar_mesh(self, pts, cols, manhattan, tol_frac, max_planes):
+        """
+        Fit dominant flat planes to the cloud via iterative RANSAC and rebuild
+        each as a flat coloured quad. With manhattan=True the planes are first
+        rotated onto orthogonal axes and snapped, so walls/floor/ceiling meet at
+        true 90 degrees. Returns a trimesh.Trimesh, or None (caller then exports
+        the raw point cloud so a result still comes out).
+        """
+        import numpy as np
+        try:
+            import open3d as o3d
+            import trimesh
+        except Exception as exc:
+            print("[VGGTSceneGenerator] planar cleanup needs open3d (%s) — exporting points." % exc)
+            return None
+
+        try:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+            pcd.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
+
+            extent = pcd.get_axis_aligned_bounding_box().get_extent()
+            diag = float(np.linalg.norm(extent)) or 1.0
+            dist_thresh = max(diag * tol_frac, 1e-6)
+
+            # RANSAC on millions of points is slow; thin large clouds first.
+            if len(pcd.points) > 300000:
+                pcd = pcd.voxel_down_sample(max(diag * 0.0025, 1e-6))
+
+            total   = len(pcd.points)
+            min_pts = max(int(0.005 * total), 150)
+
+            remaining = pcd
+            planes = []
+            for _ in range(max(1, max_planes)):
+                if len(remaining.points) < min_pts:
+                    break
+                model, inliers = remaining.segment_plane(
+                    distance_threshold=dist_thresh, ransac_n=3, num_iterations=1000)
+                if len(inliers) < min_pts:
+                    break
+                inlier = remaining.select_by_index(inliers)
+                normal = np.array(model[:3], dtype=np.float64)
+                norm = np.linalg.norm(normal)
+                if norm < 1e-9:
+                    break
+                pcolors = np.asarray(inlier.colors)
+                planes.append({
+                    "normal": normal / norm,
+                    "points": np.asarray(inlier.points),
+                    "color":  pcolors.mean(axis=0) if pcolors.size else np.array([0.72, 0.72, 0.72]),
+                    "count":  len(inliers),
+                })
+                remaining = remaining.select_by_index(inliers, invert=True)
+
+            if not planes:
+                print("[VGGTSceneGenerator] No planes found — exporting points.")
+                return None
+            print("[VGGTSceneGenerator] Fitted %d planes (%s)."
+                  % (len(planes), "manhattan" if manhattan else "raw"))
+
+            if manhattan:
+                R = self._manhattan_rotation(planes)
+                for p in planes:
+                    p["points"] = p["points"] @ R.T
+                    n = R @ p["normal"]
+                    axis = int(np.argmax(np.abs(n)))
+                    p["axis"]   = axis
+                    p["offset"] = float(np.mean(p["points"][:, axis]))
+
+            quads = [self._plane_quad(p, manhattan) for p in planes]
+            quads = [q for q in quads if q is not None]
+            if not quads:
+                return None
+            return trimesh.util.concatenate(quads)
+        except Exception as exc:
+            import traceback
+            print("[VGGTSceneGenerator] Planar cleanup failed (%s) — exporting points." % exc)
+            traceback.print_exc()
+            return None
+
+    def _manhattan_rotation(self, planes):
+        """
+        Orthonormal rotation that aligns the dominant plane normals to the world
+        axes: the largest plane sets the first axis, the most-perpendicular
+        normal sets the second, their cross gives the third. Not gravity-aware —
+        the room may sit rotated relative to world up, which is fine for corners.
+        """
+        import numpy as np
+        order = sorted(planes, key=lambda p: p["count"], reverse=True)
+        n1 = order[0]["normal"] / (np.linalg.norm(order[0]["normal"]) + 1e-12)
+
+        n2 = None
+        best = 1.0
+        for p in order[1:]:
+            n = p["normal"] / (np.linalg.norm(p["normal"]) + 1e-12)
+            dot = abs(float(np.dot(n, n1)))
+            if dot < best:
+                best, n2 = dot, n
+        if n2 is None:
+            ref = np.array([1.0, 0.0, 0.0])
+            if abs(float(np.dot(ref, n1))) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0])
+            n2 = ref
+
+        n2 = n2 - np.dot(n2, n1) * n1
+        n2 /= (np.linalg.norm(n2) + 1e-12)
+        n3 = np.cross(n1, n2)
+        n3 /= (np.linalg.norm(n3) + 1e-12)
+
+        R = np.vstack([n1, n2, n3])
+        if np.linalg.det(R) < 0:
+            R[2] = -R[2]
+        return R
+
+    def _plane_quad(self, plane, manhattan):
+        import numpy as np
+        import trimesh
+        pts = plane["points"]
+        if len(pts) < 3:
+            return None
+        color = np.clip(plane["color"], 0.0, 1.0)
+        vcol = np.tile((color * 255).astype("uint8"), (4, 1))
+
+        if manhattan:
+            axis = plane["axis"]
+            val  = plane["offset"]
+            o = [i for i in range(3) if i != axis]
+            amin, amax = float(pts[:, o[0]].min()), float(pts[:, o[0]].max())
+            bmin, bmax = float(pts[:, o[1]].min()), float(pts[:, o[1]].max())
+            combos = [(amin, bmin), (amax, bmin), (amax, bmax), (amin, bmax)]
+            corners = np.zeros((4, 3))
+            for i, (ca, cb) in enumerate(combos):
+                corners[i, axis] = val
+                corners[i, o[0]] = ca
+                corners[i, o[1]] = cb
+        else:
+            normal = plane["normal"] / (np.linalg.norm(plane["normal"]) + 1e-12)
+            centroid = pts.mean(axis=0)
+            ref = np.array([1.0, 0.0, 0.0])
+            if abs(float(np.dot(ref, normal))) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0])
+            u = np.cross(normal, ref); u /= (np.linalg.norm(u) + 1e-12)
+            v = np.cross(normal, u);  v /= (np.linalg.norm(v) + 1e-12)
+            rel = pts - centroid
+            cu, cv = rel @ u, rel @ v
+            umin, umax = float(cu.min()), float(cu.max())
+            vmin, vmax = float(cv.min()), float(cv.max())
+            corners = np.array([
+                centroid + umin * u + vmin * v,
+                centroid + umax * u + vmin * v,
+                centroid + umax * u + vmax * v,
+                centroid + umin * u + vmax * v,
+            ])
+
+        # Both windings so each surface is visible from inside the room too.
+        faces = np.array([[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]])
+        return trimesh.Trimesh(vertices=corners, faces=faces, vertex_colors=vcol, process=False)
 
     # ------------------------------------------------------------------
     # Image collection
