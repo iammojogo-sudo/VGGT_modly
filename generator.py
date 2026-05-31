@@ -355,50 +355,45 @@ class VGGTSceneGenerator(BaseGenerator):
         """
         import numpy as np
         try:
-            import open3d as o3d
             import trimesh
         except Exception as exc:
-            print("[VGGTSceneGenerator] planar cleanup needs open3d (%s) — exporting points." % exc)
+            print("[VGGTSceneGenerator] planar cleanup needs trimesh (%s)." % exc)
             return None
 
         try:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-            pcd.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
+            P = np.ascontiguousarray(pts, dtype=np.float64)
+            C = np.clip(cols, 0.0, 1.0)
 
-            extent = pcd.get_axis_aligned_bounding_box().get_extent()
-            diag = float(np.linalg.norm(extent)) or 1.0
+            diag = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
             dist_thresh = max(diag * tol_frac, 1e-6)
 
-            # RANSAC on millions of points is slow; thin large clouds first.
-            if len(pcd.points) > 300000:
-                pcd = pcd.voxel_down_sample(max(diag * 0.0025, 1e-6))
+            # RANSAC doesn't need every point; cap the working set for speed.
+            rng = np.random.default_rng(0)
+            if len(P) > 60000:
+                sel = rng.choice(len(P), 60000, replace=False)
+                P, C = P[sel], C[sel]
 
-            total   = len(pcd.points)
-            min_pts = max(int(0.005 * total), 150)
+            min_pts = max(int(0.01 * len(P)), 100)
+            idx_all = np.arange(len(P))
+            alive   = np.ones(len(P), dtype=bool)
 
-            remaining = pcd
             planes = []
             for _ in range(max(1, max_planes)):
-                if len(remaining.points) < min_pts:
+                live_idx = idx_all[alive]
+                if live_idx.size < min_pts:
                     break
-                model, inliers = remaining.segment_plane(
-                    distance_threshold=dist_thresh, ransac_n=3, num_iterations=1000)
-                if len(inliers) < min_pts:
+                model, inlier_local = self._ransac_plane(P[live_idx], dist_thresh, rng)
+                if inlier_local is None or int(inlier_local.sum()) < min_pts:
                     break
-                inlier = remaining.select_by_index(inliers)
-                normal = np.array(model[:3], dtype=np.float64)
-                norm = np.linalg.norm(normal)
-                if norm < 1e-9:
-                    break
-                pcolors = np.asarray(inlier.colors)
+                inlier_idx = live_idx[inlier_local]
+                normal, _d = model
                 planes.append({
-                    "normal": normal / norm,
-                    "points": np.asarray(inlier.points),
-                    "color":  pcolors.mean(axis=0) if pcolors.size else np.array([0.72, 0.72, 0.72]),
-                    "count":  len(inliers),
+                    "normal": normal,
+                    "points": P[inlier_idx],
+                    "color":  C[inlier_idx].mean(axis=0),
+                    "count":  int(inlier_idx.size),
                 })
-                remaining = remaining.select_by_index(inliers, invert=True)
+                alive[inlier_idx] = False
 
             if not planes:
                 print("[VGGTSceneGenerator] No planes found — exporting points.")
@@ -425,6 +420,40 @@ class VGGTSceneGenerator(BaseGenerator):
             print("[VGGTSceneGenerator] Planar cleanup failed (%s) — exporting points." % exc)
             traceback.print_exc()
             return None
+
+    def _ransac_plane(self, P, thresh, rng, iters=500):
+        """Largest-support plane via RANSAC, refined by least squares.
+        Returns ((normal, d), inlier_mask)."""
+        import numpy as np
+        n = len(P)
+        if n < 3:
+            return (None, None)
+        best_count = 0
+        best = (None, None)
+        for _ in range(iters):
+            i = rng.choice(n, 3, replace=False)
+            p1, p2, p3 = P[i]
+            normal = np.cross(p2 - p1, p3 - p1)
+            ln = float(np.linalg.norm(normal))
+            if ln < 1e-9:
+                continue
+            normal = normal / ln
+            d = -float(np.dot(normal, p1))
+            mask = np.abs(P @ normal + d) < thresh
+            c = int(mask.sum())
+            if c > best_count:
+                best_count, best = c, ((normal, d), mask)
+
+        model, mask = best
+        if mask is not None and int(mask.sum()) >= 3:
+            Q = P[mask]
+            centroid = Q.mean(axis=0)
+            _, _, vh = np.linalg.svd(Q - centroid, full_matrices=False)
+            normal = vh[-1] / (np.linalg.norm(vh[-1]) + 1e-12)
+            d = -float(np.dot(normal, centroid))
+            mask = np.abs(P @ normal + d) < thresh
+            model = (normal, d)
+        return (model, mask)
 
     def _manhattan_rotation(self, planes):
         """
