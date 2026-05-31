@@ -1,14 +1,3 @@
-"""
-VGGT Scene Reconstruction — Modly extension setup script.
-
-Called by Modly at install time:
-    python setup.py <python_exe> <ext_dir> <gpu_sm>
-
-json_args keys (alternate single-arg form):
-    python_exe  - path to Modly's embedded Python
-    ext_dir     - absolute path to this extension directory
-    gpu_sm      - GPU compute capability as integer (e.g. 89 for RTX 4050)
-"""
 import json
 import platform
 import subprocess
