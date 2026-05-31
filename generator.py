@@ -1,12 +1,15 @@
-"""
-generator.py — VGGT scene/room reconstruction for Modly.
+import contextlib
+import io
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
 
-Feed-forward multi-view geometry (Meta's VGGT-1B): takes a set of overlapping
-photos of a scene and reconstructs the observed geometry — flat walls, real
-corners — then meshes it. Unlike object generators, this is built for scenes:
-point a folder of overlapping room photos at it via the "images_dir" param and
-do NOT remove backgrounds (the walls/floor ARE the subject).
-"""
+from PIL import Image
+
+from services.generators.base import BaseGenerator, smooth_progress
 import contextlib
 import io
 import sys
@@ -153,8 +156,6 @@ class VGGTSceneGenerator(BaseGenerator):
         postprocess   = params.get("postprocess") or "none"
         plane_tol     = _safe_float(params.get("plane_tolerance"), 0.012)
         max_planes    = _safe_int(params.get("max_planes"), 10)
-        edge_filter   = _safe_float(params.get("edge_filter"), 0.05)
-        point_budget  = _safe_int(params.get("point_budget"), 500000)
 
         print("[VGGTSceneGenerator] images_dir=%s max_views=%s conf_pct=%.1f mode=%s post=%s "
               "voxel=%.4f poisson_depth=%s density_q=%.3f clean=%s max_planes=%s"
@@ -226,13 +227,16 @@ class VGGTSceneGenerator(BaseGenerator):
         # ---- Unproject depth -> world point cloud -------------------
         self._report(progress_cb, 74, "Building point cloud...")
         world_pts = unproject_depth_map_to_point_map(depth_np, extr_np, intr_np)  # [S, H, W, 3]
+        # VGGT/OpenCV world is Y-down, Z-forward; glTF viewers (Modly) are Y-up.
+        # Rotate 180 deg about X (negate Y and Z) so it isn't upside down. det=+1,
+        # so this is a proper rotation -> no mirroring, winding/normals unchanged.
+        world_pts = world_pts * np.array([1.0, -1.0, -1.0])
         pts  = world_pts.reshape(-1, 3)
         cols = np.transpose(imgs_np, (0, 2, 3, 1)).reshape(-1, 3)                 # [N, 3] in 0..1
         conf = conf_np.reshape(-1)
-        edge = self._depth_edge_mask(depth_np, edge_filter).reshape(-1)          # drop flying pixels
 
-        keep = np.isfinite(pts).all(axis=1) & edge
-        pts, cols, conf = pts[keep], cols[keep], conf[keep]
+        finite = np.isfinite(pts).all(axis=1)
+        pts, cols, conf = pts[finite], cols[finite], conf[finite]
 
         if conf.size and 0 < conf_pct < 100:
             keep = conf >= np.percentile(conf, conf_pct)
@@ -240,7 +244,7 @@ class VGGTSceneGenerator(BaseGenerator):
 
         cols = np.clip(cols, 0.0, 1.0)
         if pts.shape[0] == 0:
-            raise RuntimeError("All points were filtered out — lower the Confidence/Edge filter.")
+            raise RuntimeError("All points were filtered out — lower the Confidence Filter.")
         print("[VGGTSceneGenerator] %d points after filtering." % pts.shape[0])
 
         # ---- Mesh (or export raw point cloud) -----------------------
@@ -261,14 +265,16 @@ class VGGTSceneGenerator(BaseGenerator):
             if out_obj is not None:
                 out_kind = "planar"
         elif output_mode != "pointcloud":
-            self._report(progress_cb, 82, "Meshing (Poisson)...")
+            self._report(progress_cb, 82, "Meshing...")
             out_obj = self._poisson_mesh(pts, cols, voxel_size, poisson_depth, density_q, clean_float)
+            if out_obj is None:
+                # open3d missing/failed -> dense grid mesh straight from the depth maps
+                self._report(progress_cb, 86, "Meshing (depth grid)...")
+                out_obj = self._depth_grid_mesh(world_pts, imgs_np, conf_np, conf_pct)
             if out_obj is not None:
                 out_kind = "scene"
 
         if out_obj is None:
-            pts, cols = self._budget(pts, cols, point_budget)
-            print("[VGGTSceneGenerator] Exporting %d points." % len(pts))
             out_obj = trimesh.PointCloud(pts, (cols * 255).astype("uint8"))
 
         out_path = self.outputs_dir / ("%s_%s.glb" % (stamp, out_kind))
@@ -285,11 +291,6 @@ class VGGTSceneGenerator(BaseGenerator):
     # ------------------------------------------------------------------
 
     def _poisson_mesh(self, pts, cols, voxel_size, poisson_depth, density_q, clean_floaters):
-        """
-        Point cloud -> mesh via Open3D screened Poisson. Returns a
-        trimesh.Trimesh, or None if Open3D is missing / meshing fails — the
-        caller then exports the raw point cloud so a result still comes out.
-        """
         import numpy as np
         try:
             import open3d as o3d
@@ -351,13 +352,6 @@ class VGGTSceneGenerator(BaseGenerator):
     # ------------------------------------------------------------------
 
     def _planar_mesh(self, pts, cols, manhattan, tol_frac, max_planes):
-        """
-        Fit dominant flat planes to the cloud via iterative RANSAC and rebuild
-        each as a flat coloured quad. With manhattan=True the planes are first
-        rotated onto orthogonal axes and snapped, so walls/floor/ceiling meet at
-        true 90 degrees. Returns a trimesh.Trimesh, or None (caller then exports
-        the raw point cloud so a result still comes out).
-        """
         import numpy as np
         try:
             import trimesh
@@ -427,8 +421,6 @@ class VGGTSceneGenerator(BaseGenerator):
             return None
 
     def _ransac_plane(self, P, thresh, rng, iters=500):
-        """Largest-support plane via RANSAC, refined by least squares.
-        Returns ((normal, d), inlier_mask)."""
         import numpy as np
         n = len(P)
         if n < 3:
@@ -461,12 +453,6 @@ class VGGTSceneGenerator(BaseGenerator):
         return (model, mask)
 
     def _manhattan_rotation(self, planes):
-        """
-        Orthonormal rotation that aligns the dominant plane normals to the world
-        axes: the largest plane sets the first axis, the most-perpendicular
-        normal sets the second, their cross gives the third. Not gravity-aware —
-        the room may sit rotated relative to world up, which is fine for corners.
-        """
         import numpy as np
         order = sorted(planes, key=lambda p: p["count"], reverse=True)
         n1 = order[0]["normal"] / (np.linalg.norm(order[0]["normal"]) + 1e-12)
@@ -507,8 +493,8 @@ class VGGTSceneGenerator(BaseGenerator):
             axis = plane["axis"]
             val  = plane["offset"]
             o = [i for i in range(3) if i != axis]
-            amin, amax = float(pts[:, o[0]].min()), float(pts[:, o[0]].max())
-            bmin, bmax = float(pts[:, o[1]].min()), float(pts[:, o[1]].max())
+            amin, amax = np.percentile(pts[:, o[0]], [2, 98])
+            bmin, bmax = np.percentile(pts[:, o[1]], [2, 98])
             combos = [(amin, bmin), (amax, bmin), (amax, bmax), (amin, bmax)]
             corners = np.zeros((4, 3))
             for i, (ca, cb) in enumerate(combos):
@@ -525,8 +511,8 @@ class VGGTSceneGenerator(BaseGenerator):
             v = np.cross(normal, u);  v /= (np.linalg.norm(v) + 1e-12)
             rel = pts - centroid
             cu, cv = rel @ u, rel @ v
-            umin, umax = float(cu.min()), float(cu.max())
-            vmin, vmax = float(cv.min()), float(cv.max())
+            umin, umax = np.percentile(cu, [2, 98])
+            vmin, vmax = np.percentile(cv, [2, 98])
             corners = np.array([
                 centroid + umin * u + vmin * v,
                 centroid + umax * u + vmin * v,
@@ -539,36 +525,80 @@ class VGGTSceneGenerator(BaseGenerator):
         return trimesh.Trimesh(vertices=corners, faces=faces, vertex_colors=vcol, process=False)
 
     # ------------------------------------------------------------------
-    # Point-cloud cleanup
+    # Open3D-free dense meshing
     # ------------------------------------------------------------------
 
-    def _depth_edge_mask(self, depth_np, strength):
-        """
-        Mask out 'flying pixels' at depth discontinuities (the stretched skirts
-        in the raw cloud) by dropping pixels whose local depth gradient is large
-        relative to the scene's median depth. strength <= 0 disables it.
-        """
+    def _depth_grid_mesh(self, world_pts, imgs_np, conf_np, conf_pct, cull_factor=8.0):
         import numpy as np
-        if not strength or strength <= 0:
-            return np.ones(depth_np.shape[:3], dtype=bool)
-        d = depth_np[..., 0]  # [S, H, W]
-        keep = np.ones_like(d, dtype=bool)
-        for s in range(d.shape[0]):
-            ds = d[s]
-            gy, gx = np.gradient(ds)
-            grad = np.hypot(gx, gy)
-            valid = ds[ds > 0]
-            med = float(np.median(valid)) if valid.size else 1.0
-            keep[s] = grad < (strength * med)
-        return keep
+        try:
+            import trimesh
+        except Exception as exc:
+            print("[VGGTSceneGenerator] grid mesh needs trimesh (%s)." % exc)
+            return None
 
-    def _budget(self, pts, cols, budget):
-        """Randomly thin the cloud to a viewer-friendly point count."""
-        import numpy as np
-        if budget and budget > 0 and len(pts) > budget:
-            sel = np.random.default_rng(0).choice(len(pts), budget, replace=False)
-            return pts[sel], cols[sel]
-        return pts, cols
+        try:
+            S, H, W, _ = world_pts.shape
+            imgs = np.transpose(imgs_np, (0, 2, 3, 1))            # [S, H, W, 3]
+            finite_all = np.isfinite(world_pts).all(axis=-1)      # [S, H, W]
+            Psafe = np.where(np.isfinite(world_pts), world_pts, 0.0)
+
+            cflat = conf_np.reshape(-1)
+            if cflat.size and 0 < conf_pct < 100:
+                thr_conf = np.percentile(cflat, conf_pct)
+            else:
+                thr_conf = -np.inf
+
+            idx = np.arange(H * W).reshape(H, W)
+            tl = idx[:-1, :-1].ravel(); tr = idx[:-1, 1:].ravel()
+            bl = idx[1:, :-1].ravel();  br = idx[1:, 1:].ravel()
+
+            parts = []
+            for s in range(S):
+                P = Psafe[s].reshape(-1, 3)
+                C = imgs[s].reshape(-1, 3)
+                V = finite_all[s].reshape(-1) & (conf_np[s].reshape(-1) >= thr_conf)
+
+                quad_ok = V[tl] & V[tr] & V[bl] & V[br]
+                if not quad_ok.any():
+                    continue
+
+                def elen(a, b):
+                    return np.linalg.norm(P[a] - P[b], axis=1)
+                e = np.maximum.reduce([elen(tl, bl), elen(tl, tr), elen(tr, br),
+                                       elen(bl, br), elen(tl, br), elen(tr, bl)])
+                typ = float(np.median(elen(tl, bl)[quad_ok]))
+                if not np.isfinite(typ) or typ <= 0:
+                    typ = float(np.median(e[quad_ok])) or 1.0
+                ok = quad_ok & (e < cull_factor * typ)
+                if not ok.any():
+                    continue
+
+                f = np.vstack([
+                    np.stack([tl[ok], bl[ok], tr[ok]], axis=1),
+                    np.stack([tr[ok], bl[ok], br[ok]], axis=1),
+                ])
+                used = np.unique(f)
+                remap = np.full(H * W, -1, dtype=np.int64)
+                remap[used] = np.arange(used.size)
+                parts.append(trimesh.Trimesh(
+                    vertices=P[used],
+                    faces=remap[f],
+                    vertex_colors=(np.clip(C[used], 0.0, 1.0) * 255).astype("uint8"),
+                    process=False,
+                ))
+
+            if not parts:
+                print("[VGGTSceneGenerator] grid mesh produced no faces — exporting points.")
+                return None
+            mesh = trimesh.util.concatenate(parts)
+            print("[VGGTSceneGenerator] grid mesh: %d verts, %d faces."
+                  % (len(mesh.vertices), len(mesh.faces)))
+            return mesh
+        except Exception as exc:
+            import traceback
+            print("[VGGTSceneGenerator] grid meshing failed (%s) — exporting points." % exc)
+            traceback.print_exc()
+            return None
 
     # ------------------------------------------------------------------
     # Image collection
