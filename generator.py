@@ -153,6 +153,8 @@ class VGGTSceneGenerator(BaseGenerator):
         postprocess   = params.get("postprocess") or "none"
         plane_tol     = _safe_float(params.get("plane_tolerance"), 0.012)
         max_planes    = _safe_int(params.get("max_planes"), 10)
+        edge_filter   = _safe_float(params.get("edge_filter"), 0.05)
+        point_budget  = _safe_int(params.get("point_budget"), 500000)
 
         print("[VGGTSceneGenerator] images_dir=%s max_views=%s conf_pct=%.1f mode=%s post=%s "
               "voxel=%.4f poisson_depth=%s density_q=%.3f clean=%s max_planes=%s"
@@ -227,9 +229,10 @@ class VGGTSceneGenerator(BaseGenerator):
         pts  = world_pts.reshape(-1, 3)
         cols = np.transpose(imgs_np, (0, 2, 3, 1)).reshape(-1, 3)                 # [N, 3] in 0..1
         conf = conf_np.reshape(-1)
+        edge = self._depth_edge_mask(depth_np, edge_filter).reshape(-1)          # drop flying pixels
 
-        finite = np.isfinite(pts).all(axis=1)
-        pts, cols, conf = pts[finite], cols[finite], conf[finite]
+        keep = np.isfinite(pts).all(axis=1) & edge
+        pts, cols, conf = pts[keep], cols[keep], conf[keep]
 
         if conf.size and 0 < conf_pct < 100:
             keep = conf >= np.percentile(conf, conf_pct)
@@ -237,7 +240,7 @@ class VGGTSceneGenerator(BaseGenerator):
 
         cols = np.clip(cols, 0.0, 1.0)
         if pts.shape[0] == 0:
-            raise RuntimeError("All points were filtered out — lower the Confidence Filter.")
+            raise RuntimeError("All points were filtered out — lower the Confidence/Edge filter.")
         print("[VGGTSceneGenerator] %d points after filtering." % pts.shape[0])
 
         # ---- Mesh (or export raw point cloud) -----------------------
@@ -264,6 +267,8 @@ class VGGTSceneGenerator(BaseGenerator):
                 out_kind = "scene"
 
         if out_obj is None:
+            pts, cols = self._budget(pts, cols, point_budget)
+            print("[VGGTSceneGenerator] Exporting %d points." % len(pts))
             out_obj = trimesh.PointCloud(pts, (cols * 255).astype("uint8"))
 
         out_path = self.outputs_dir / ("%s_%s.glb" % (stamp, out_kind))
@@ -532,6 +537,38 @@ class VGGTSceneGenerator(BaseGenerator):
         # Both windings so each surface is visible from inside the room too.
         faces = np.array([[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]])
         return trimesh.Trimesh(vertices=corners, faces=faces, vertex_colors=vcol, process=False)
+
+    # ------------------------------------------------------------------
+    # Point-cloud cleanup
+    # ------------------------------------------------------------------
+
+    def _depth_edge_mask(self, depth_np, strength):
+        """
+        Mask out 'flying pixels' at depth discontinuities (the stretched skirts
+        in the raw cloud) by dropping pixels whose local depth gradient is large
+        relative to the scene's median depth. strength <= 0 disables it.
+        """
+        import numpy as np
+        if not strength or strength <= 0:
+            return np.ones(depth_np.shape[:3], dtype=bool)
+        d = depth_np[..., 0]  # [S, H, W]
+        keep = np.ones_like(d, dtype=bool)
+        for s in range(d.shape[0]):
+            ds = d[s]
+            gy, gx = np.gradient(ds)
+            grad = np.hypot(gx, gy)
+            valid = ds[ds > 0]
+            med = float(np.median(valid)) if valid.size else 1.0
+            keep[s] = grad < (strength * med)
+        return keep
+
+    def _budget(self, pts, cols, budget):
+        """Randomly thin the cloud to a viewer-friendly point count."""
+        import numpy as np
+        if budget and budget > 0 and len(pts) > budget:
+            sel = np.random.default_rng(0).choice(len(pts), budget, replace=False)
+            return pts[sel], cols[sel]
+        return pts, cols
 
     # ------------------------------------------------------------------
     # Image collection
