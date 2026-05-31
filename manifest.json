@@ -119,6 +119,43 @@
             { "value": "false", "label": "No" }
           ],
           "tooltip": "Discards small disconnected mesh fragments, keeping only the largest connected surface."
+        },
+        {
+          "id": "postprocess",
+          "label": "Planar Cleanup",
+          "type": "select",
+          "default": "none",
+          "options": [
+            { "value": "none",          "label": "Off (raw mesh / points)" },
+            { "value": "ransac_planes", "label": "RANSAC planes (flatten surfaces)" },
+            { "value": "manhattan",     "label": "Manhattan snap (square 90° corners)" }
+          ],
+          "tooltip": "Fits dominant flat planes (walls/floor/ceiling) to the point cloud. 'RANSAC planes' rebuilds each surface as a genuinely flat quad. 'Manhattan snap' also rotates them onto orthogonal axes so corners meet at true 90 degrees. Both replace the Poisson mesh; if no planes are found it exports the point cloud."
+        },
+        {
+          "id": "plane_tolerance",
+          "label": "Plane Tolerance",
+          "type": "select",
+          "default": "0.012",
+          "options": [
+            { "value": "0.006", "label": "Tight" },
+            { "value": "0.012", "label": "Default" },
+            { "value": "0.025", "label": "Loose (noisy data)" }
+          ],
+          "tooltip": "RANSAC inlier distance as a fraction of the scene size. Larger merges more points into each plane (good for noisy clouds); smaller keeps planes thin but may split a single wall in two."
+        },
+        {
+          "id": "max_planes",
+          "label": "Max Planes",
+          "type": "select",
+          "default": 10,
+          "options": [
+            { "value": 6,  "label": "6 (bare room)" },
+            { "value": 10, "label": "10 (default)" },
+            { "value": 15, "label": "15" },
+            { "value": 20, "label": "20 (cluttered)" }
+          ],
+          "tooltip": "How many flat surfaces to extract, largest first. A bare room is ~6 (4 walls + floor + ceiling); raise it if furniture or shelves should also become planes."
         }
       ],
       "output": "mesh",
