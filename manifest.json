@@ -52,7 +52,8 @@
             { "value": 16, "label": "16" },
             { "value": 24, "label": "24 (8 GB safe)" },
             { "value": 32, "label": "32" },
-            { "value": 48, "label": "48 (needs more VRAM)" }
+            { "value": 48, "label": "48 (needs more VRAM)" },
+            { "value": 200, "label": "200 (lets do this!)" }
           ],
           "tooltip": "Caps how many photos are fed to the model. VGGT memory grows with view count; lower this if you hit out-of-memory."
         },
