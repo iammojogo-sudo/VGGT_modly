@@ -156,11 +156,13 @@ class VGGTSceneGenerator(BaseGenerator):
         postprocess   = params.get("postprocess") or "none"
         plane_tol     = _safe_float(params.get("plane_tolerance"), 0.012)
         max_planes    = _safe_int(params.get("max_planes"), 10)
+        grid_stride   = _safe_int(params.get("grid_stride"), 2)
+        rec_mode      = params.get("reconstruction_mode") or "joint"
 
         print("[VGGTSceneGenerator] images_dir=%s max_views=%s conf_pct=%.1f mode=%s post=%s "
-              "voxel=%.4f poisson_depth=%s density_q=%.3f clean=%s max_planes=%s"
+              "voxel=%.4f poisson_depth=%s density_q=%.3f clean=%s max_planes=%s rec=%s"
               % (images_dir, max_views, conf_pct, output_mode, postprocess,
-                 voxel_size, poisson_depth, density_q, clean_float, max_planes))
+                 voxel_size, poisson_depth, density_q, clean_float, max_planes, rec_mode))
 
         # ---- Collect input images -----------------------------------
         self._report(progress_cb, 4, "Collecting images...")
@@ -186,63 +188,69 @@ class VGGTSceneGenerator(BaseGenerator):
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
         from vggt.utils.geometry import unproject_depth_map_to_point_map
 
-        # ---- Inference ----------------------------------------------
-        self._report(progress_cb, 18, "Reconstructing scene...")
-        stop_evt = threading.Event()
-        thread   = None
-        if progress_cb:
-            thread = threading.Thread(
-                target=smooth_progress,
-                args=(progress_cb, 18, 70, "Reconstructing scene...", stop_evt),
-                daemon=True,
+        # ---- Inference (joint or incremental) ----------------------
+        world_pts     = None   # only set in joint mode; used by grid-mesh fallback
+        inc_grid_mesh = None   # only set in incremental mode
+
+        if rec_mode == "incremental":
+            pts, cols, inc_grid_mesh = self._incremental_build(
+                image_paths, conf_pct, grid_stride, output_mode,
+                progress_cb, cancel_event,
             )
-            thread.start()
+        else:
+            self._report(progress_cb, 18, "Reconstructing scene (joint)...")
+            stop_evt = threading.Event()
+            thread   = None
+            if progress_cb:
+                thread = threading.Thread(
+                    target=smooth_progress,
+                    args=(progress_cb, 18, 70, "Reconstructing scene...", stop_evt),
+                    daemon=True,
+                )
+                thread.start()
 
-        try:
-            images = load_and_preprocess_images([str(p) for p in image_paths]).to(self._device)
-            with torch.no_grad():
-                if self._device == "cuda":
-                    autocast = torch.cuda.amp.autocast(dtype=self._dtype)
-                else:
-                    autocast = contextlib.nullcontext()
-                with autocast:
-                    batch = images[None]  # [1, S, 3, H, W]
-                    tokens, ps_idx = self._model.aggregator(batch)
-                pose_enc = self._model.camera_head(tokens)[-1]
-                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batch.shape[-2:])
-                depth_map, depth_conf = self._model.depth_head(tokens, batch, ps_idx)
+            try:
+                images = load_and_preprocess_images([str(p) for p in image_paths]).to(self._device)
+                with torch.no_grad():
+                    if self._device == "cuda":
+                        autocast = torch.cuda.amp.autocast(dtype=self._dtype)
+                    else:
+                        autocast = contextlib.nullcontext()
+                    with autocast:
+                        batch = images[None]  # [1, S, 3, H, W]
+                        tokens, ps_idx = self._model.aggregator(batch)
+                    pose_enc = self._model.camera_head(tokens)[-1]
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batch.shape[-2:])
+                    depth_map, depth_conf = self._model.depth_head(tokens, batch, ps_idx)
 
-            depth_np = depth_map.squeeze(0).float().cpu().numpy()   # [S, H, W, 1]
-            conf_np  = depth_conf.squeeze(0).float().cpu().numpy()  # [S, H, W]
-            extr_np  = extrinsic.squeeze(0).float().cpu().numpy()   # [S, 3, 4]
-            intr_np  = intrinsic.squeeze(0).float().cpu().numpy()   # [S, 3, 3]
-            imgs_np  = batch.squeeze(0).float().cpu().numpy()       # [S, 3, H, W]
-        finally:
-            stop_evt.set()
-            if thread:
-                thread.join(timeout=1.0)
+                depth_np = depth_map.squeeze(0).float().cpu().numpy()
+                conf_np  = depth_conf.squeeze(0).float().cpu().numpy()
+                extr_np  = extrinsic.squeeze(0).float().cpu().numpy()
+                intr_np  = intrinsic.squeeze(0).float().cpu().numpy()
+                imgs_np  = batch.squeeze(0).float().cpu().numpy()
+            finally:
+                stop_evt.set()
+                if thread:
+                    thread.join(timeout=1.0)
 
-        self._check_cancelled(cancel_event)
+            self._check_cancelled(cancel_event)
 
-        # ---- Unproject depth -> world point cloud -------------------
-        self._report(progress_cb, 74, "Building point cloud...")
-        world_pts = unproject_depth_map_to_point_map(depth_np, extr_np, intr_np)  # [S, H, W, 3]
-        # VGGT/OpenCV world is Y-down, Z-forward; glTF viewers (Modly) are Y-up.
-        # Rotate 180 deg about X (negate Y and Z) so it isn't upside down. det=+1,
-        # so this is a proper rotation -> no mirroring, winding/normals unchanged.
-        world_pts = world_pts * np.array([1.0, -1.0, -1.0])
-        pts  = world_pts.reshape(-1, 3)
-        cols = np.transpose(imgs_np, (0, 2, 3, 1)).reshape(-1, 3)                 # [N, 3] in 0..1
-        conf = conf_np.reshape(-1)
+            self._report(progress_cb, 74, "Building point cloud...")
+            world_pts = unproject_depth_map_to_point_map(depth_np, extr_np, intr_np)
+            world_pts = world_pts * np.array([1.0, -1.0, -1.0])
+            pts  = world_pts.reshape(-1, 3)
+            cols = np.transpose(imgs_np, (0, 2, 3, 1)).reshape(-1, 3)
+            conf = conf_np.reshape(-1)
 
-        finite = np.isfinite(pts).all(axis=1)
-        pts, cols, conf = pts[finite], cols[finite], conf[finite]
+            finite = np.isfinite(pts).all(axis=1)
+            pts, cols, conf = pts[finite], cols[finite], conf[finite]
 
-        if conf.size and 0 < conf_pct < 100:
-            keep = conf >= np.percentile(conf, conf_pct)
-            pts, cols = pts[keep], cols[keep]
+            if conf.size and 0 < conf_pct < 100:
+                keep = conf >= np.percentile(conf, conf_pct)
+                pts, cols = pts[keep], cols[keep]
 
-        cols = np.clip(cols, 0.0, 1.0)
+            cols = np.clip(cols, 0.0, 1.0)
+
         if pts.shape[0] == 0:
             raise RuntimeError("All points were filtered out — lower the Confidence Filter.")
         print("[VGGTSceneGenerator] %d points after filtering." % pts.shape[0])
@@ -268,9 +276,11 @@ class VGGTSceneGenerator(BaseGenerator):
             self._report(progress_cb, 82, "Meshing...")
             out_obj = self._poisson_mesh(pts, cols, voxel_size, poisson_depth, density_q, clean_float)
             if out_obj is None:
-                # open3d missing/failed -> dense grid mesh straight from the depth maps
                 self._report(progress_cb, 86, "Meshing (depth grid)...")
-                out_obj = self._depth_grid_mesh(world_pts, imgs_np, conf_np, conf_pct)
+                if inc_grid_mesh is not None:
+                    out_obj = inc_grid_mesh
+                elif world_pts is not None:
+                    out_obj = self._depth_grid_mesh(world_pts, imgs_np, conf_np, conf_pct, grid_stride)
             if out_obj is not None:
                 out_kind = "scene"
 
@@ -285,6 +295,222 @@ class VGGTSceneGenerator(BaseGenerator):
 
         self._report(progress_cb, 100, "Done")
         return str(out_path)
+
+    # ------------------------------------------------------------------
+    # Incremental reconstruction
+    # ------------------------------------------------------------------
+
+    def _incremental_build(self, image_paths, conf_pct, grid_stride, output_mode,
+                           progress_cb, cancel_event):
+        import numpy as np
+        import trimesh
+        import torch
+        from vggt.utils.load_fn import load_and_preprocess_images
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+        acc_pts, acc_cols = None, None
+        do_grid = (output_mode != "pointcloud")
+        n = len(image_paths)
+
+        # Write each aligned mesh to a temp file immediately rather than keeping
+        # them all in RAM — avoids both memory pile-up and concatenation colour
+        # issues with large in-memory lists.
+        tmp_dir = Path(tempfile.mkdtemp(prefix="vggt_inc_"))
+        temp_paths = []
+
+        for i, path in enumerate(image_paths):
+            self._report(progress_cb, 18 + int(64 * i / n),
+                         "Image %d/%d..." % (i + 1, n))
+            self._check_cancelled(cancel_event)
+
+            images = load_and_preprocess_images([str(path)]).to(self._device)
+            with torch.no_grad():
+                if self._device == "cuda":
+                    autocast = torch.cuda.amp.autocast(dtype=self._dtype)
+                else:
+                    autocast = contextlib.nullcontext()
+                with autocast:
+                    batch  = images[None]  # [1, 1, 3, H, W]
+                    tokens, ps_idx = self._model.aggregator(batch)
+                pose_enc  = self._model.camera_head(tokens)[-1]
+                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batch.shape[-2:])
+                depth_map, depth_conf = self._model.depth_head(tokens, batch, ps_idx)
+
+            depth_np = depth_map.squeeze(0).float().cpu().numpy()
+            conf_np  = depth_conf.squeeze(0).float().cpu().numpy()
+            extr_np  = extrinsic.squeeze(0).float().cpu().numpy()
+            intr_np  = intrinsic.squeeze(0).float().cpu().numpy()
+            imgs_np  = batch.squeeze(0).float().cpu().numpy()
+
+            world_pts = unproject_depth_map_to_point_map(depth_np, extr_np, intr_np)
+            world_pts = world_pts * np.array([1.0, -1.0, -1.0])
+
+            pts_i  = world_pts.reshape(-1, 3)
+            cols_i = np.transpose(imgs_np, (0, 2, 3, 1)).reshape(-1, 3)
+            conf_i = conf_np.reshape(-1)
+
+            finite = np.isfinite(pts_i).all(axis=1)
+            pts_i, cols_i, conf_i = pts_i[finite], cols_i[finite], conf_i[finite]
+            if conf_i.size and 0 < conf_pct < 100:
+                keep = conf_i >= np.percentile(conf_i, conf_pct)
+                pts_i, cols_i = pts_i[keep], cols_i[keep]
+            cols_i = np.clip(cols_i, 0.0, 1.0)
+
+            print("[VGGTSceneGenerator] Image %d/%d: %d points" % (i + 1, n, len(pts_i)))
+
+            R = t = s = None
+
+            if acc_pts is not None and len(pts_i) > 3:
+                n_sub   = min(8000, len(pts_i), len(acc_pts))
+                rng     = np.random.default_rng(i)
+                src_idx = rng.choice(len(pts_i),   n_sub, replace=False)
+                ref_idx = rng.choice(len(acc_pts), n_sub, replace=False)
+                R, t, s = self._align_clouds(
+                    pts_i[src_idx], cols_i[src_idx],
+                    acc_pts[ref_idx], acc_cols[ref_idx],
+                )
+                if R is not None:
+                    pts_i = s * (pts_i @ R.T) + t
+                    print("[VGGTSceneGenerator] Image %d aligned (scale=%.4f)." % (i + 1, s))
+                else:
+                    print("[VGGTSceneGenerator] Image %d alignment failed — appending in local space." % (i + 1))
+
+            # Build mesh in this image's local space then apply the same transform
+            if do_grid:
+                mesh_i = self._depth_grid_mesh(world_pts, imgs_np, conf_np, conf_pct, grid_stride)
+                if mesh_i is not None:
+                    if R is not None:
+                        verts = np.asarray(mesh_i.vertices, dtype=np.float64)
+                        mesh_i.vertices = s * (verts @ R.T) + t
+                    tmp = tmp_dir / ("mesh_%04d.glb" % i)
+                    try:
+                        mesh_i.export(str(tmp))
+                        temp_paths.append(tmp)
+                        print("[VGGTSceneGenerator] Saved temp mesh %d: %d verts %d faces"
+                              % (i, len(mesh_i.vertices), len(mesh_i.faces)))
+                    except Exception as exc:
+                        print("[VGGTSceneGenerator] Temp mesh save failed: %s" % exc)
+                    del mesh_i
+
+            if acc_pts is None:
+                acc_pts, acc_cols = pts_i, cols_i
+            else:
+                acc_pts  = np.concatenate([acc_pts,  pts_i])
+                acc_cols = np.concatenate([acc_cols, cols_i])
+                if len(acc_pts) > 800000:
+                    sel = np.random.default_rng(i).choice(len(acc_pts), 800000, replace=False)
+                    acc_pts, acc_cols = acc_pts[sel], acc_cols[sel]
+
+        # Load temp files fresh and concatenate — avoids any in-memory state issues
+        combined_mesh = None
+        if temp_paths:
+            print("[VGGTSceneGenerator] Loading %d temp meshes for final combine..." % len(temp_paths))
+            parts = []
+            for p in temp_paths:
+                try:
+                    m = trimesh.load(str(p), process=False)
+                    if isinstance(m, trimesh.scene.Scene):
+                        geoms = list(m.geometry.values())
+                        if geoms:
+                            m = trimesh.util.concatenate(geoms) if len(geoms) > 1 else geoms[0]
+                    parts.append(m)
+                except Exception as exc:
+                    print("[VGGTSceneGenerator] Failed to reload temp mesh %s: %s" % (p.name, exc))
+            if parts:
+                combined_mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+                print("[VGGTSceneGenerator] Combined: %d verts, %d faces from %d meshes"
+                      % (len(combined_mesh.vertices), len(combined_mesh.faces), len(parts)))
+
+        pts  = acc_pts  if acc_pts  is not None else np.zeros((0, 3))
+        cols = acc_cols if acc_cols is not None else np.zeros((0, 3))
+        return pts, cols, combined_mesh
+
+    def _align_clouds(self, src_pts, src_cols, ref_pts, ref_cols,
+                      color_thresh=0.15, iters=1500):
+        import numpy as np
+        try:
+            from scipy.spatial import KDTree
+        except ImportError:
+            print("[VGGTSceneGenerator] scipy missing — skipping alignment.")
+            return None, None, None
+
+        # Per-pixel brightness normalisation: divide each pixel's RGB by its own
+        # mean brightness. A dark red and a bright red become the same normalised
+        # colour. Per-channel std normalisation was the previous approach but made
+        # all colours look similar (7999/8000 hit rate = pure noise).
+        def brightness_norm(c):
+            lum = c.mean(axis=1, keepdims=True) + 0.01
+            return c / lum  # values in ~[0, 3]
+
+        src_n = brightness_norm(src_cols)
+        ref_n = brightness_norm(ref_cols)
+
+        tree = KDTree(ref_n)
+        dists, idxs = tree.query(src_n, k=1, workers=-1)
+        mask = dists < color_thresh
+        n_cand = int(mask.sum())
+        print("[VGGTSceneGenerator]   colour candidates: %d / %d" % (n_cand, len(src_pts)))
+        if n_cand < 6:
+            return None, None, None
+
+        cs = src_pts[mask]
+        cr = ref_pts[idxs[mask]]
+        if len(cs) > 2000:
+            sel = np.random.default_rng(0).choice(len(cs), 2000, replace=False)
+            cs, cr = cs[sel], cr[sel]
+
+        diag   = float(np.linalg.norm(cr.max(0) - cr.min(0))) or 1.0
+        thresh = max(diag * 0.05, 1e-4)
+        n      = len(cs)
+        best_n, best = 0, (None, None, None)
+        rng = np.random.default_rng(7)
+
+        for _ in range(iters):
+            idx = rng.choice(n, 4, replace=False)
+            R, t, s = self._umeyama(cs[idx], cr[idx])
+            # VGGT produces metric depth, so single-image runs on the same scene
+            # should need only a small scale correction. Anything outside 0.5-2.0
+            # is a degenerate colour-noise solution and must be rejected.
+            if R is None or not (0.5 < s < 2.0):
+                continue
+            res = np.linalg.norm(s * (cs @ R.T) + t - cr, axis=1)
+            c = int((res < thresh).sum())
+            if c > best_n:
+                best_n, best = c, (R, t, s)
+
+        R, t, s = best
+        if R is None:
+            print("[VGGTSceneGenerator]   RANSAC: no valid transform within scale bounds (0.5-2.0).")
+            return None, None, None
+
+        res = np.linalg.norm(s * (cs @ R.T) + t - cr, axis=1)
+        inliers = res < thresh
+        if inliers.sum() >= 4:
+            Rf, tf, sf = self._umeyama(cs[inliers], cr[inliers])
+            if Rf is not None and (0.3 < sf < 3.0):
+                R, t, s = Rf, tf, sf
+
+        print("[VGGTSceneGenerator]   RANSAC inliers: %d / %d  scale=%.4f"
+              % (int(inliers.sum()), n, s))
+        return R, t, s
+
+    def _umeyama(self, src, dst):
+        import numpy as np
+        n = src.shape[0]
+        mu_s, mu_d = src.mean(0), dst.mean(0)
+        sc, dc = src - mu_s, dst - mu_d
+        var_s = (sc ** 2).sum() / n
+        if var_s < 1e-12:
+            return None, None, None
+        cov = dc.T @ sc / n
+        U, S, Vt = np.linalg.svd(cov)
+        d = np.linalg.det(U @ Vt)
+        D = np.diag([1.0, 1.0, d])
+        R = U @ D @ Vt
+        s = float((S * D.diagonal()).sum() / var_s)
+        t = mu_d - s * R @ mu_s
+        return R, t, s
 
     # ------------------------------------------------------------------
     # Meshing
@@ -346,6 +572,91 @@ class VGGTSceneGenerator(BaseGenerator):
             print("[VGGTSceneGenerator] Meshing failed (%s) — exporting point cloud." % exc)
             traceback.print_exc()
             return None
+
+    # ------------------------------------------------------------------
+    # Depth-grid meshing (open3d-free, always produces faces)
+    # ------------------------------------------------------------------
+
+    def _depth_grid_mesh(self, world_pts, imgs_np, conf_np, conf_pct, stride=2, cull_factor=8.0):
+        import numpy as np
+        import trimesh
+
+        S, H, W = world_pts.shape[:3]
+        cols_4d = np.transpose(imgs_np, (0, 2, 3, 1))  # [S, H, W, 3]
+
+        all_verts, all_cols, all_faces = [], [], []
+        vert_offset = 0
+
+        for s in range(S):
+            pts_s  = world_pts[s]   # [H, W, 3]
+            col_s  = cols_4d[s]     # [H, W, 3]
+            conf_s = conf_np[s]     # [H, W]
+
+            ys = np.arange(0, H, stride)
+            xs = np.arange(0, W, stride)
+            h, w = len(ys), len(xs)
+
+            pts_g  = pts_s[np.ix_(ys, xs)]   # [h, w, 3]
+            col_g  = col_s[np.ix_(ys, xs)]   # [h, w, 3]
+            conf_g = conf_s[np.ix_(ys, xs)]  # [h, w]
+
+            valid = np.isfinite(pts_g).all(axis=2)
+            if conf_pct > 0:
+                valid &= conf_g >= np.percentile(conf_g, conf_pct)
+
+            # Quad corner flat indices
+            ig, jg = np.meshgrid(np.arange(h - 1), np.arange(w - 1), indexing='ij')
+            ig, jg = ig.ravel(), jg.ravel()
+            tl = ig * w + jg
+            tr = ig * w + (jg + 1)
+            bl = (ig + 1) * w + jg
+            br = (ig + 1) * w + (jg + 1)
+
+            vf = valid.ravel()
+            ok = vf[tl] & vf[tr] & vf[bl] & vf[br]
+            tl, tr, bl, br = tl[ok], tr[ok], bl[ok], br[ok]
+            if len(tl) == 0:
+                continue
+
+            verts = pts_g.reshape(-1, 3)
+            vcols = np.clip(col_g.reshape(-1, 3), 0.0, 1.0)
+
+            # Cull quads that span a depth discontinuity
+            if cull_factor > 0:
+                p = verts
+                e = np.maximum.reduce([
+                    np.linalg.norm(p[tr] - p[tl], axis=1),
+                    np.linalg.norm(p[bl] - p[tl], axis=1),
+                    np.linalg.norm(p[br] - p[tr], axis=1),
+                    np.linalg.norm(p[br] - p[bl], axis=1),
+                ])
+                med_e = float(np.median(e))
+                keep = e < (cull_factor * med_e)
+                tl, tr, bl, br = tl[keep], tr[keep], bl[keep], br[keep]
+            if len(tl) == 0:
+                continue
+
+            faces = np.vstack([
+                np.column_stack([tl, tr, bl]),
+                np.column_stack([tr, br, bl]),
+            ])
+
+            used, inv = np.unique(faces, return_inverse=True)
+            faces = inv.reshape(faces.shape)
+            all_verts.append(verts[used])
+            all_cols.append(vcols[used])
+            all_faces.append(faces + vert_offset)
+            vert_offset += len(used)
+
+        if not all_verts:
+            print("[VGGTSceneGenerator] depth-grid mesh: no faces produced.")
+            return None
+
+        v = np.concatenate(all_verts)
+        c = (np.concatenate(all_cols) * 255).astype(np.uint8)
+        f = np.concatenate(all_faces)
+        print("[VGGTSceneGenerator] depth-grid mesh: %d verts, %d faces (stride=%d)" % (len(v), len(f), stride))
+        return trimesh.Trimesh(vertices=v, faces=f, vertex_colors=c, process=False)
 
     # ------------------------------------------------------------------
     # Planar cleanup (RANSAC + Manhattan snap)
