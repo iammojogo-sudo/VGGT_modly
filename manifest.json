@@ -37,8 +37,14 @@
           "type": "select",
           "default": "joint",
           "options": [
-            { "value": "joint",       "label": "Joint — all images in one pass (default)" },
-            { "value": "incremental", "label": "Incremental — one image at a time, then align" }
+            {
+              "value": "joint",
+              "label": "Joint — all images in one pass (default)"
+            },
+            {
+              "value": "incremental",
+              "label": "Incremental — one image at a time, then align"
+            }
           ],
           "tooltip": "Joint runs all images through VGGT simultaneously and lets the model solve camera poses globally. Incremental runs VGGT on each image separately (better single-image quality) then stitches the clouds together using color correspondences. Try Incremental if joint produces petal/folding artifacts with your photos."
         },
@@ -48,12 +54,38 @@
           "type": "select",
           "default": 24,
           "options": [
-            { "value": 8,  "label": "8" },
-            { "value": 16, "label": "16" },
-            { "value": 24, "label": "24 (8 GB safe)" },
-            { "value": 32, "label": "32" },
-            { "value": 48, "label": "48 (needs more VRAM)" },
-            { "value": 200, "label": "200 (lets do this!)" }
+            {
+              "value": 8,
+              "label": "8"
+            },
+            {
+              "value": 16,
+              "label": "16"
+            },
+            {
+              "value": 24,
+              "label": "24 (8 GB safe)"
+            },
+            {
+              "value": 32,
+              "label": "32"
+            },
+            {
+              "value": 48,
+              "label": "48 (needs more VRAM)"
+            },
+            {
+              "value": 100,
+              "label": "100 (lets do this!)"
+            },
+            {
+              "value": 200,
+              "label": "200 (Gonna take a while!)"
+            },
+            {
+              "value": 400,
+              "label": "400 (Are you a corporation?!)"
+            }
           ],
           "tooltip": "Caps how many photos are fed to the model. VGGT memory grows with view count; lower this if you hit out-of-memory."
         },
@@ -63,11 +95,26 @@
           "type": "select",
           "default": "50.0",
           "options": [
-            { "value": "0.0",  "label": "Off (keep all)" },
-            { "value": "30.0", "label": "Light (30%)" },
-            { "value": "50.0", "label": "Default (50%)" },
-            { "value": "70.0", "label": "Strict (70%)" },
-            { "value": "85.0", "label": "Very strict (85%)" }
+            {
+              "value": "0.0",
+              "label": "Off (keep all)"
+            },
+            {
+              "value": "30.0",
+              "label": "Light (30%)"
+            },
+            {
+              "value": "50.0",
+              "label": "Default (50%)"
+            },
+            {
+              "value": "70.0",
+              "label": "Strict (70%)"
+            },
+            {
+              "value": "85.0",
+              "label": "Very strict (85%)"
+            }
           ],
           "tooltip": "Drops the lowest-confidence depth points before meshing. Higher removes more noise and floaters but thins the cloud."
         },
@@ -77,8 +124,14 @@
           "type": "select",
           "default": "mesh",
           "options": [
-            { "value": "mesh",       "label": "Mesh (Poisson)" },
-            { "value": "pointcloud", "label": "Point cloud only" }
+            {
+              "value": "mesh",
+              "label": "Mesh (Poisson)"
+            },
+            {
+              "value": "pointcloud",
+              "label": "Point cloud only"
+            }
           ],
           "tooltip": "Mesh outputs a triangulated surface: Poisson if Open3D is installed, otherwise a dense per-view depth-grid mesh (no Open3D needed). Point cloud exports the raw colored points."
         },
@@ -88,10 +141,22 @@
           "type": "select",
           "default": "0.01",
           "options": [
-            { "value": "0",     "label": "Off" },
-            { "value": "0.005", "label": "Fine (0.005)" },
-            { "value": "0.01",  "label": "Default (0.01)" },
-            { "value": "0.02",  "label": "Coarse (0.02)" }
+            {
+              "value": "0",
+              "label": "Off"
+            },
+            {
+              "value": "0.005",
+              "label": "Fine (0.005)"
+            },
+            {
+              "value": "0.01",
+              "label": "Default (0.01)"
+            },
+            {
+              "value": "0.02",
+              "label": "Coarse (0.02)"
+            }
           ],
           "tooltip": "Voxel size for thinning the cloud before meshing. Larger = fewer points, faster, smoother."
         },
@@ -101,10 +166,22 @@
           "type": "select",
           "default": 9,
           "options": [
-            { "value": 8,  "label": "Low (8)" },
-            { "value": 9,  "label": "Default (9)" },
-            { "value": 10, "label": "High (10)" },
-            { "value": 11, "label": "Higher (11)" }
+            {
+              "value": 8,
+              "label": "Low (8)"
+            },
+            {
+              "value": 9,
+              "label": "Default (9)"
+            },
+            {
+              "value": 10,
+              "label": "High (10)"
+            },
+            {
+              "value": 11,
+              "label": "Higher (11)"
+            }
           ],
           "tooltip": "Poisson octree depth. Higher = more detail but more memory and more spurious surface."
         },
@@ -114,10 +191,22 @@
           "type": "select",
           "default": "0.02",
           "options": [
-            { "value": "0.0",  "label": "Off" },
-            { "value": "0.02", "label": "Default (2%)" },
-            { "value": "0.05", "label": "More (5%)" },
-            { "value": "0.1",  "label": "Aggressive (10%)" }
+            {
+              "value": "0.0",
+              "label": "Off"
+            },
+            {
+              "value": "0.02",
+              "label": "Default (2%)"
+            },
+            {
+              "value": "0.05",
+              "label": "More (5%)"
+            },
+            {
+              "value": "0.1",
+              "label": "Aggressive (10%)"
+            }
           ],
           "tooltip": "Removes the lowest-density Poisson vertices, trimming the inflated 'bubble' Poisson adds around sparse areas."
         },
@@ -127,8 +216,14 @@
           "type": "select",
           "default": "true",
           "options": [
-            { "value": "true",  "label": "Yes" },
-            { "value": "false", "label": "No" }
+            {
+              "value": "true",
+              "label": "Yes"
+            },
+            {
+              "value": "false",
+              "label": "No"
+            }
           ],
           "tooltip": "Discards small disconnected mesh fragments, keeping only the largest connected surface."
         },
@@ -138,9 +233,18 @@
           "type": "select",
           "default": "none",
           "options": [
-            { "value": "none",          "label": "Off (raw mesh / points)" },
-            { "value": "ransac_planes", "label": "RANSAC planes (flatten surfaces)" },
-            { "value": "manhattan",     "label": "Manhattan snap (square 90° corners)" }
+            {
+              "value": "none",
+              "label": "Off (raw mesh / points)"
+            },
+            {
+              "value": "ransac_planes",
+              "label": "RANSAC planes (flatten surfaces)"
+            },
+            {
+              "value": "manhattan",
+              "label": "Manhattan snap (square 90° corners)"
+            }
           ],
           "tooltip": "Fits dominant flat planes (walls/floor/ceiling) to the point cloud. 'RANSAC planes' rebuilds each surface as a genuinely flat quad. 'Manhattan snap' also rotates them onto orthogonal axes so corners meet at true 90 degrees. Both replace the Poisson mesh; if no planes are found it exports the point cloud."
         },
@@ -150,9 +254,18 @@
           "type": "select",
           "default": "0.012",
           "options": [
-            { "value": "0.006", "label": "Tight" },
-            { "value": "0.012", "label": "Default" },
-            { "value": "0.025", "label": "Loose (noisy data)" }
+            {
+              "value": "0.006",
+              "label": "Tight"
+            },
+            {
+              "value": "0.012",
+              "label": "Default"
+            },
+            {
+              "value": "0.025",
+              "label": "Loose (noisy data)"
+            }
           ],
           "tooltip": "RANSAC inlier distance as a fraction of the scene size. Larger merges more points into each plane (good for noisy clouds); smaller keeps planes thin but may split a single wall in two."
         },
@@ -162,10 +275,22 @@
           "type": "select",
           "default": 10,
           "options": [
-            { "value": 6,  "label": "6 (bare room)" },
-            { "value": 10, "label": "10 (default)" },
-            { "value": 15, "label": "15" },
-            { "value": 20, "label": "20 (cluttered)" }
+            {
+              "value": 6,
+              "label": "6 (bare room)"
+            },
+            {
+              "value": 10,
+              "label": "10 (default)"
+            },
+            {
+              "value": 15,
+              "label": "15"
+            },
+            {
+              "value": 20,
+              "label": "20 (cluttered)"
+            }
           ],
           "tooltip": "How many flat surfaces to extract, largest first. A bare room is ~6 (4 walls + floor + ceiling); raise it if furniture or shelves should also become planes."
         },
@@ -175,11 +300,26 @@
           "type": "select",
           "default": 2,
           "options": [
-            { "value": 1, "label": "Ultra — every pixel (~2M+ faces, slow)" },
-            { "value": 2, "label": "High (default)" },
-            { "value": 3, "label": "Medium" },
-            { "value": 4, "label": "Low" },
-            { "value": 6, "label": "Lowest (fastest)" }
+            {
+              "value": 1,
+              "label": "Ultra — every pixel (~2M+ faces, slow)"
+            },
+            {
+              "value": 2,
+              "label": "High (default)"
+            },
+            {
+              "value": 3,
+              "label": "Medium"
+            },
+            {
+              "value": 4,
+              "label": "Low"
+            },
+            {
+              "value": 6,
+              "label": "Lowest (fastest)"
+            }
           ],
           "tooltip": "Controls triangle count in the depth-grid mesh (used when Poisson/open3d is unavailable). Stride 1 = one vertex per depth pixel = maximum detail. Doubles faces for each step down."
         }
