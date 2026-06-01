@@ -32,6 +32,17 @@
           "tooltip": "Folder containing the overlapping photos of the room/scene. Every image in this folder is used. If left empty, only the single image wired into the node is used (poor for rooms)."
         },
         {
+          "id": "reconstruction_mode",
+          "label": "Reconstruction Mode",
+          "type": "select",
+          "default": "joint",
+          "options": [
+            { "value": "joint",       "label": "Joint — all images in one pass (default)" },
+            { "value": "incremental", "label": "Incremental — one image at a time, then align" }
+          ],
+          "tooltip": "Joint runs all images through VGGT simultaneously and lets the model solve camera poses globally. Incremental runs VGGT on each image separately (better single-image quality) then stitches the clouds together using color correspondences. Try Incremental if joint produces petal/folding artifacts with your photos."
+        },
+        {
           "id": "max_views",
           "label": "Max Views",
           "type": "select",
@@ -156,6 +167,20 @@
             { "value": 20, "label": "20 (cluttered)" }
           ],
           "tooltip": "How many flat surfaces to extract, largest first. A bare room is ~6 (4 walls + floor + ceiling); raise it if furniture or shelves should also become planes."
+        },
+        {
+          "id": "grid_stride",
+          "label": "Grid Mesh Detail",
+          "type": "select",
+          "default": 2,
+          "options": [
+            { "value": 1, "label": "Ultra — every pixel (~2M+ faces, slow)" },
+            { "value": 2, "label": "High (default)" },
+            { "value": 3, "label": "Medium" },
+            { "value": 4, "label": "Low" },
+            { "value": 6, "label": "Lowest (fastest)" }
+          ],
+          "tooltip": "Controls triangle count in the depth-grid mesh (used when Poisson/open3d is unavailable). Stride 1 = one vertex per depth pixel = maximum detail. Doubles faces for each step down."
         }
       ],
       "output": "mesh",
