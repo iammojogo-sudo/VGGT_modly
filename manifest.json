@@ -2,7 +2,7 @@
   "id": "vggt_scene",
   "name": "VGGT Scene Reconstruction",
   "type": "model",
-  "source": "https://github.com/facebookresearch/vggt",
+  "source": "https://github.com/iammojogo-sudo/VGGT_modly",
   "description": "Feed-forward multi-view scene/room reconstruction (Meta VGGT-1B). Point it at a folder of overlapping photos of a room and it reconstructs the observed geometry — flat walls, real corners — then meshes it. Built for scenes, not single objects: do NOT remove backgrounds and provide several overlapping views. Outputs a colored mesh, and falls back to a point cloud if meshing is unavailable.",
   "version": "1.0.0",
   "author": "iammojogo",
